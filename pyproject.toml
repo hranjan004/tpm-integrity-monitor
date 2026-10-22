@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpm-integrity-monitor"
+version = "0.1.0"
+description = "Linux TPM 2.0 attestation and device integrity monitor"
+requires-python = ">=3.11"
+dependencies = ["fastapi==0.119.0", "uvicorn==0.37.0", "cryptography==46.0.2", "httpx==0.28.1"]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.2"]
+
+[project.scripts]
+integrity-agent = "integrity.agent:main"
+
+[tool.setuptools.packages.find]
+include = ["integrity*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

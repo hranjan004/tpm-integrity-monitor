@@ -1,0 +1,9 @@
+name: TPM tests
+on: [push, pull_request]
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t tpm-integrity:test .
+      - run: docker run --rm tpm-integrity:test sh scripts/simulator.sh python -m pytest -v

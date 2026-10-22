@@ -1,0 +1,52 @@
+services:
+  verifier:
+    build: .
+    image: tpm-integrity-monitor:local
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Run sh scripts/init-env.sh first}
+      INTEGRITY_DB: /app/state/verifier.db
+    volumes:
+      - verifier-state:/app/state
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+  demo:
+    image: tpm-integrity-monitor:local
+    profiles: ["demo"]
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      VERIFIER_URL: http://verifier:8000
+    depends_on:
+      verifier:
+        condition: service_healthy
+    command: ["sh", "scripts/simulator.sh", "python", "scripts/demo.py"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+  test:
+    image: tpm-integrity-monitor:local
+    profiles: ["test"]
+    command: ["sh", "scripts/simulator.sh", "python", "-m", "pytest", "-v"]
+    cap_drop: ["ALL"]
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["127.0.0.1:9090:9090"]
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?Run sh scripts/init-env.sh first}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports: ["127.0.0.1:3001:3000"]
+volumes:
+  verifier-state:

@@ -1,0 +1,17 @@
+groups:
+  - name: integrity
+    rules:
+      - alert: DeviceAttestationRejected
+        expr: integrity_device_trusted == 0
+        for: 30s
+        labels: {severity: warning}
+        annotations: {summary: "Device attestation failed"}
+      - alert: DeviceAttestationStale
+        expr: time() - integrity_last_attestation_timestamp_seconds > 120
+        for: 30s
+        labels: {severity: warning}
+        annotations: {summary: "Device stopped reporting"}
+      - alert: VerifierUnavailable
+        expr: up{job="integrity"} == 0
+        for: 30s
+        labels: {severity: critical}
