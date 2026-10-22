@@ -3,8 +3,8 @@ set -eu
 # This simulator is private to this container and disposable. Never clear a physical TPM.
 mkdir -p /tmp/integrity-swtpm
 swtpm socket --tpm2 --tpmstate dir=/tmp/integrity-swtpm --ctrl type=tcp,port=2322,bindaddr=127.0.0.1 --server type=tcp,port=2321,bindaddr=127.0.0.1 --flags not-need-init &
-TPM_PID=$!
-trap 'kill "$TPM_PID" 2>/dev/null || true' EXIT
+SIMULATOR_PROCESS_ID=$!
+trap 'kill "$SIMULATOR_PROCESS_ID" 2>/dev/null || true' EXIT
 export TPM2TOOLS_TCTI=swtpm:host=127.0.0.1,port=2321
 sleep 1
 tpm2_startup -c

@@ -1,8 +1,7 @@
 # Validation record
 
-Executed on October 22, 2026 in the harshranjan macOS development environment,
-using Docker Desktop 28.0.4 and Linux containers. Work and commit chronology use
-the actual execution date; this work is not represented as completed on October 15.
+Executed on October 22, 2026 using Docker Desktop 28.0.4 on macOS and Linux
+containers. GitHub Actions also passed the Linux container build and all 22 tests.
 
 ## Automated verification
 

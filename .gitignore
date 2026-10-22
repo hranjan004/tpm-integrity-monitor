@@ -8,3 +8,4 @@ state/
 *.ctx
 *.priv
 *.pem
+.ruff_cache/

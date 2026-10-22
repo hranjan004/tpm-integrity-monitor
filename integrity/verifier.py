@@ -1,4 +1,5 @@
 """Single-host persistent verifier. SQLite transactions serialize nonce consumption."""
+
 from contextlib import contextmanager
 import hashlib
 import hmac
@@ -16,11 +17,11 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from .crypto import config_digest, decode, public_key, qualification, verify
 
-log = logging.getLogger("integrity.events")
-if not log.handlers:
-    log.addHandler(logging.StreamHandler())
-log.setLevel(logging.INFO)
-log.propagate = False
+event_logger = logging.getLogger("integrity.events")
+if not event_logger.handlers:
+    event_logger.addHandler(logging.StreamHandler())
+event_logger.setLevel(logging.INFO)
+event_logger.propagate = False
 
 
 class Enrollment(BaseModel):
@@ -37,29 +38,31 @@ class Evidence(BaseModel):
     config: dict[str, str] = Field(max_length=64)
 
 
-def token_hash(token):
-    return hashlib.sha256(token.encode()).hexdigest()
+def token_hash(bearer_token):
+    return hashlib.sha256(bearer_token.encode()).hexdigest()
 
 
-def create_app(db_path=None, admin_token=None, ttl=60):
-    path = Path(db_path or os.environ.get("INTEGRITY_DB", "state/verifier.db"))
-    admin = admin_token or os.environ.get("ADMIN_TOKEN", "")
-    if len(admin) < 32:
+def create_app(database_path=None, administrator_token=None, challenge_lifetime=60):
+    database_file = Path(
+        database_path or os.environ.get("INTEGRITY_DB", "state/verifier.db")
+    )
+    administrator_secret = administrator_token or os.environ.get("ADMIN_TOKEN", "")
+    if len(administrator_secret) < 32:
         raise RuntimeError("ADMIN_TOKEN must contain at least 32 characters")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    database_file.parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
     def db():
-        con = sqlite3.connect(path, timeout=10)
-        con.row_factory = sqlite3.Row
+        connection = sqlite3.connect(database_file, timeout=10)
+        connection.row_factory = sqlite3.Row
         try:
-            with con:
-                yield con
+            with connection:
+                yield connection
         finally:
-            con.close()
+            connection.close()
 
-    with db() as con:
-        con.executescript('''
+    with db() as connection:
+        connection.executescript("""
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS devices (
           device TEXT PRIMARY KEY, pem TEXT NOT NULL, pcr TEXT NOT NULL,
@@ -69,9 +72,9 @@ def create_app(db_path=None, admin_token=None, ttl=60):
         CREATE TABLE IF NOT EXISTS events (
           id INTEGER PRIMARY KEY, ts REAL NOT NULL, device TEXT NOT NULL,
           accepted INTEGER NOT NULL, reason TEXT NOT NULL, details TEXT NOT NULL);
-        ''')
-    os.chmod(path, 0o600)
-    app = FastAPI(title="TPM Integrity Monitor", version="0.1.0")
+        """)
+    os.chmod(database_file, 0o600)
+    application = FastAPI(title="TPM Integrity Monitor", version="0.1.0")
 
     def bearer(authorization):
         if not authorization or not authorization.startswith("Bearer "):
@@ -79,99 +82,184 @@ def create_app(db_path=None, admin_token=None, ttl=60):
         return authorization[7:]
 
     def administrator(authorization: str | None = Header(default=None)):
-        if not hmac.compare_digest(bearer(authorization), admin):
+        if not hmac.compare_digest(bearer(authorization), administrator_secret):
             raise HTTPException(403, "admin_required")
 
     def device_auth(device: str, authorization: str | None = Header(default=None)):
-        token = token_hash(bearer(authorization))
-        with db() as con:
-            row = con.execute("SELECT * FROM devices WHERE device=? AND active=1", (device,)).fetchone()
-        if row is None or not hmac.compare_digest(token, row["token"]):
+        bearer_token = token_hash(bearer(authorization))
+        with db() as connection:
+            stored_record = connection.execute(
+                "SELECT * FROM devices WHERE device=? AND active=1", (device,)
+            ).fetchone()
+        if stored_record is None or not hmac.compare_digest(
+            bearer_token, stored_record["token"]
+        ):
             raise HTTPException(403, "device_authentication_failed")
-        return dict(row)
+        return dict(stored_record)
 
-    @app.get("/healthz")
+    @application.get("/healthz")
     def health():
         return {"status": "ok"}
 
-    @app.post("/v1/enroll", dependencies=[Depends(administrator)], status_code=201)
-    def enroll(body: Enrollment):
+    @application.post(
+        "/v1/enroll", dependencies=[Depends(administrator)], status_code=201
+    )
+    def enroll(submission: Enrollment):
         try:
-            public_key(body.public_key)
+            public_key(submission.public_key)
         except (ValueError, TypeError):
             raise HTTPException(422, "invalid_public_key")
-        token = secrets.token_urlsafe(32)
+        bearer_token = secrets.token_urlsafe(32)
         try:
-            with db() as con:
-                con.execute("INSERT INTO devices(device,pem,pcr,config,token) VALUES (?,?,?,?,?)",
-                            (body.device, body.public_key, body.pcr_digest, body.config_digest, token_hash(token)))
+            with db() as connection:
+                connection.execute(
+                    "INSERT INTO devices(device,pem,pcr,config,token) VALUES (?,?,?,?,?)",
+                    (
+                        submission.device,
+                        submission.public_key,
+                        submission.pcr_digest,
+                        submission.config_digest,
+                        token_hash(bearer_token),
+                    ),
+                )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "already_enrolled")
-        return {"device": body.device, "token": token}
+        return {"device": submission.device, "token": bearer_token}
 
-    @app.delete("/v1/devices/{device}", dependencies=[Depends(administrator)])
+    @application.delete("/v1/devices/{device}", dependencies=[Depends(administrator)])
     def revoke(device: str):
-        with db() as con:
-            con.execute("UPDATE devices SET active=0 WHERE device=?", (device,))
-            con.execute("DELETE FROM challenges WHERE device=?", (device,))
+        with db() as connection:
+            connection.execute("UPDATE devices SET active=0 WHERE device=?", (device,))
+            connection.execute("DELETE FROM challenges WHERE device=?", (device,))
         return {"revoked": device}
 
-    @app.post("/v1/devices/{device}/challenge")
-    def challenge(device: str, identity=Depends(device_auth)):
-        nonce = secrets.token_hex(32)
-        with db() as con:
-            con.execute("INSERT OR REPLACE INTO challenges VALUES (?,?,?)", (device, nonce, time.time() + ttl))
-        return {"nonce": nonce, "expires_in": ttl, "selection": "sha256:0,2,7,16"}
+    @application.post("/v1/devices/{device}/challenge")
+    def challenge(device: str, enrolled_device=Depends(device_auth)):
+        challenge_nonce = secrets.token_hex(32)
+        with db() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO challenges VALUES (?,?,?)",
+                (device, challenge_nonce, time.time() + challenge_lifetime),
+            )
+        return {
+            "nonce": challenge_nonce,
+            "expires_in": challenge_lifetime,
+            "selection": "sha256:0,2,7,16",
+        }
 
-    @app.post("/v1/devices/{device}/attest")
-    def attest(device: str, body: Evidence, identity=Depends(device_auth)):
+    @application.post("/v1/devices/{device}/attest")
+    def attest(device: str, submission: Evidence, enrolled_device=Depends(device_auth)):
         # Consume even failed submissions. BEGIN IMMEDIATE prevents two workers accepting a replay.
-        with db() as con:
-            con.execute("BEGIN IMMEDIATE")
-            row = con.execute("SELECT * FROM challenges WHERE device=?", (device,)).fetchone()
-            live = con.execute("SELECT active FROM devices WHERE device=?", (device,)).fetchone()
-            valid = live and live[0] and row and hmac.compare_digest(row["nonce"], body.nonce) and row["expires"] > time.time()
-            if row and hmac.compare_digest(row["nonce"], body.nonce):
-                con.execute("DELETE FROM challenges WHERE device=?", (device,))
-            reason, details = "nonce_expired_or_replayed", {}
-            if valid:
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            stored_record = connection.execute(
+                "SELECT * FROM challenges WHERE device=?", (device,)
+            ).fetchone()
+            device_status = connection.execute(
+                "SELECT active FROM devices WHERE device=?", (device,)
+            ).fetchone()
+            challenge_is_valid = (
+                device_status
+                and device_status[0]
+                and stored_record
+                and hmac.compare_digest(stored_record["nonce"], submission.nonce)
+                and stored_record["expires"] > time.time()
+            )
+            if stored_record and hmac.compare_digest(
+                stored_record["nonce"], submission.nonce
+            ):
+                connection.execute("DELETE FROM challenges WHERE device=?", (device,))
+            verdict_reason, quote_details = "nonce_expired_or_replayed", {}
+            if challenge_is_valid:
                 try:
-                    if any(len(k) > 256 or len(v) > 4096 for k, v in body.config.items()):
+                    if any(
+                        len(field_name) > 256 or len(field_value) > 4096
+                        for field_name, field_value in submission.config.items()
+                    ):
                         raise ValueError("config_too_large")
-                    details = verify(identity["pem"], decode(body.message), decode(body.signature),
-                                     qualification(body.nonce, device, body.config), identity["pcr"])
-                    if config_digest(body.config) != identity["config"]:
+                    quote_details = verify(
+                        enrolled_device["pem"],
+                        decode(submission.message),
+                        decode(submission.signature),
+                        qualification(submission.nonce, device, submission.config),
+                        enrolled_device["pcr"],
+                    )
+                    if config_digest(submission.config) != enrolled_device["config"]:
                         raise ValueError("config_drift")
-                    reason = "verified"
+                    verdict_reason = "verified"
                 except InvalidSignature:
-                    reason = "signature_invalid"
-                except (ValueError, TypeError) as exc:
+                    verdict_reason = "signature_invalid"
+                except (ValueError, TypeError) as error:
                     # Only expose known validation codes, never parser internals or submitted text.
-                    code = str(exc)
-                    allowed = {"config_too_large", "pcr_drift", "config_drift", "nonce_or_config_binding", "pcr_selection", "unsafe_clock"}
-                    reason = code if code in allowed else "malformed_evidence"
-            accepted = reason == "verified"
-            event = {"ts": time.time(), "device": device, "accepted": accepted, "reason": reason, "details": details}
-            con.execute("INSERT INTO events(ts,device,accepted,reason,details) VALUES (?,?,?,?,?)",
-                        (event["ts"], device, int(accepted), reason, json.dumps(details)))
-        log.info(json.dumps(event))
-        return event
+                    validation_code = str(error)
+                    public_error_codes = {
+                        "config_too_large",
+                        "pcr_drift",
+                        "config_drift",
+                        "nonce_or_config_binding",
+                        "pcr_selection",
+                        "unsafe_clock",
+                    }
+                    verdict_reason = (
+                        validation_code
+                        if validation_code in public_error_codes
+                        else "malformed_evidence"
+                    )
+            is_accepted = verdict_reason == "verified"
+            attestation_event = {
+                "ts": time.time(),
+                "device": device,
+                "accepted": is_accepted,
+                "reason": verdict_reason,
+                "details": quote_details,
+            }
+            connection.execute(
+                "INSERT INTO events(ts,device,accepted,reason,details) VALUES (?,?,?,?,?)",
+                (
+                    attestation_event["ts"],
+                    device,
+                    int(is_accepted),
+                    verdict_reason,
+                    json.dumps(quote_details),
+                ),
+            )
+        event_logger.info(json.dumps(attestation_event))
+        return attestation_event
 
-    @app.get("/v1/events", dependencies=[Depends(administrator)])
+    @application.get("/v1/events", dependencies=[Depends(administrator)])
     def events():
-        with db() as con:
-            return [dict(r) for r in con.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100")]
+        with db() as connection:
+            return [
+                dict(event_row)
+                for event_row in connection.execute(
+                    "SELECT * FROM events ORDER BY id DESC LIMIT 100"
+                )
+            ]
 
-    @app.get("/metrics", response_class=PlainTextResponse)
+    @application.get("/metrics", response_class=PlainTextResponse)
     def metrics():
         # Keep this endpoint on a private monitoring network; it reveals device IDs.
-        lines = ["# TYPE integrity_attestations_total counter", "# TYPE integrity_device_trusted gauge", "# TYPE integrity_last_attestation_timestamp_seconds gauge"]
-        with db() as con:
-            for r in con.execute("SELECT device,reason,count(*) n FROM events GROUP BY device,reason"):
-                lines.append(f'integrity_attestations_total{{device="{r["device"]}",reason="{r["reason"]}"}} {r["n"]}')
-            for r in con.execute("SELECT e.* FROM events e JOIN (SELECT device,max(id) id FROM events GROUP BY device) x ON e.id=x.id"):
-                lines.append(f'integrity_device_trusted{{device="{r["device"]}"}} {r["accepted"]}')
-                lines.append(f'integrity_last_attestation_timestamp_seconds{{device="{r["device"]}"}} {r["ts"]}')
-        return "\n".join(lines) + "\n"
+        metric_lines = [
+            "# TYPE integrity_attestations_total counter",
+            "# TYPE integrity_device_trusted gauge",
+            "# TYPE integrity_last_attestation_timestamp_seconds gauge",
+        ]
+        with db() as connection:
+            for event_row in connection.execute(
+                "SELECT device,reason,count(*) n FROM events GROUP BY device,reason"
+            ):
+                metric_lines.append(
+                    f'integrity_attestations_total{{device="{event_row["device"]}",reason="{event_row["reason"]}"}} {event_row["n"]}'
+                )
+            for event_row in connection.execute(
+                "SELECT e.* FROM events e JOIN (SELECT device,max(id) id FROM events GROUP BY device) x ON e.id=x.id"
+            ):
+                metric_lines.append(
+                    f'integrity_device_trusted{{device="{event_row["device"]}"}} {event_row["accepted"]}'
+                )
+                metric_lines.append(
+                    f'integrity_last_attestation_timestamp_seconds{{device="{event_row["device"]}"}} {event_row["ts"]}'
+                )
+        return "\n".join(metric_lines) + "\n"
 
-    return app
+    return application
